@@ -25,14 +25,6 @@
 #include "h2o.h"
 #include "../probes_.h"
 
-#include <stdlib.h>
-#include <string.h>
-#include "h2o/http3_oblivious.h"
-#include <openssl/evp.h>
-#include <openssl/hpke.h>
-#include <openssl/err.h>
-#include <stdio.h>
-
 #define MODULE_NAME "lib/handler/connect.c"
 
 struct st_connect_handler_t {
@@ -131,72 +123,6 @@ struct st_connect_generator_t {
         } udp;
     };
 };
-
-/* Flag indicating if Proxy-Oblivious HPKE unwrap is enabled (via config) */
-int have_proxy_obliv_key = 0;
-/* Private key for HPKE unwrapping (EVP_PKEY format) */
-EVP_PKEY *proxy_obliv_priv = NULL;
-
-static unsigned char *b64_decode(const char *b64, size_t len, size_t *out_len) {
-    BIO *b64bio = BIO_new(BIO_f_base64());
-    BIO *mem = BIO_new_mem_buf(b64, (int)len);
-    BIO_set_flags(b64bio, BIO_FLAGS_BASE64_NO_NL);
-    mem = BIO_push(b64bio, mem);
-
-    unsigned char *buf = OPENSSL_malloc(len);
-    int dec_len = BIO_read(mem, buf, (int)len);
-    BIO_free_all(mem);
-
-    if (dec_len <= 0) {
-        OPENSSL_free(buf);
-        *out_len = 0;
-        return NULL;
-    }
-
-    *out_len = dec_len;
-    return buf;
-}
-
-/**
- * Initializes the HPKE receiver context by loading the Base64URL-encoded private key file.
- * Must be called once at startup before handling any CONNECT requests.
- */
-void init_proxy_oblivious(const char *priv_b64_path)
-{
-    FILE *f = fopen(priv_b64_path, "r");
-    if (!f) { perror("fopen priv key"); exit(1); }
-    fseek(f, 0, SEEK_END);
-    size_t len = ftell(f);
-    rewind(f);
-    char *b64 = malloc(len + 1);
-    if (fread(b64, 1, len, f) != len) { fprintf(stderr, "failed to read private key file\n"); exit(1); }
-    b64[len] = '\0';
-    fclose(f);
-
-    size_t sk_raw_len;
-    unsigned char *sk_raw = b64_decode(b64, len, &sk_raw_len);
-    free(b64);
-
-    if (sk_raw == NULL) {
-        fprintf(stderr, "failed to decode base64 private key\n");
-        exit(1);
-    }
-
-    proxy_obliv_priv = EVP_PKEY_new_raw_private_key(
-        EVP_PKEY_X25519,       // key type
-        NULL,                  // engine
-        sk_raw, sk_raw_len     // raw private key bytes
-    );
-    OPENSSL_free(sk_raw);
-
-    if (proxy_obliv_priv == NULL) {
-        fprintf(stderr, "EVP_PKEY_new_raw_private_key failed\n");
-        ERR_print_errors_fp(stderr);
-        exit(1);
-    }
-
-    have_proxy_obliv_key = 1;
-}
 
 static h2o_iovec_t get_proxy_status_identity(h2o_req_t *req)
 {
@@ -1115,114 +1041,36 @@ static int on_req_core(struct st_connect_handler_t *handler, h2o_req_t *req, h2o
 static int on_req_classic_connect(h2o_handler_t *_handler, h2o_req_t *req)
 {
     struct st_connect_handler_t *handler = (void *)_handler;
-    h2o_iovec_t host = { NULL, 0 };
-    uint16_t    port = 0;
-    int         is_tcp;
+    h2o_iovec_t host;
+    uint16_t port;
+    int is_tcp;
 
-    // Only handle plain CONNECT (not HTTP upgrades)
-    if (req->upgrade.base != NULL)
+    if (req->upgrade.base != NULL) {
         return -1;
-
-    // Determine TCP vs UDP CONNECT-UDP
-    if (h2o_memis(req->method.base, req->method.len, H2O_STRLIT("CONNECT"))) {
+    } else if (h2o_memis(req->method.base, req->method.len, H2O_STRLIT("CONNECT"))) {
+        /* old-style CONNECT */
         is_tcp = 1;
     } else if (h2o_memis(req->method.base, req->method.len, H2O_STRLIT("CONNECT-UDP"))) {
+        /* masque (draft 03); host and port are stored the same way as ordinary CONNECT
+         * TODO remove code once we drop support for draft-03 */
         if (!handler->config.support_masque_draft_03) {
             h2o_send_error_405(req, "Method Not Allowed", "Method Not Allowed", H2O_SEND_ERROR_KEEP_HEADERS);
             return 0;
         }
         is_tcp = 0;
     } else {
-        // Not a CONNECT request
+        /* it is not the task of this handler to handle non-CONNECT requests */
         return -1;
     }
 
-    // --- 1) If we have an HPKE key, see if the client sent us a Proxy-Oblivious blob ---
-    if (have_proxy_obliv_key) {
-        ssize_t idx = h2o_find_header_by_str(&req->headers, H2O_STRLIT("x-oblivious-dest"), -1);
-        if (idx != -1) {
-            h2o_iovec_t *v = &req->headers.entries[idx].value;
-
-            // Base64URL-decode
-            h2o_iovec_t decoded = h2o_decode_base64url(&req->pool, v->base, v->len);
-            if (decoded.base == NULL) {
-                h2o_send_error_400(req, "Bad Request", "malformed Proxy-Oblivious", H2O_SEND_ERROR_KEEP_HEADERS);
-                return 0;
-            }
-
-            uint8_t *blob    = (uint8_t *)decoded.base;
-            size_t   blob_len = decoded.len;
-
-            // Split into enc || ct
-            OSSL_HPKE_SUITE suite = OSSL_HPKE_SUITE_DEFAULT;
-            size_t enc_len = OSSL_HPKE_get_public_encap_size(suite);
-            if (blob_len < enc_len) {
-                h2o_send_error_400(req, "Bad Request", "malformed Proxy-Oblivious", H2O_SEND_ERROR_KEEP_HEADERS);
-                return 0;
-            }
-            unsigned char *enc = blob;
-            unsigned char *ct  = blob + enc_len;
-            size_t         ct_len = blob_len - enc_len;
-
-            // Create HPKE receiver ctx
-            OSSL_HPKE_CTX *rctx = OSSL_HPKE_CTX_new(OSSL_HPKE_MODE_BASE,
-                                                    suite,
-                                                    OSSL_HPKE_ROLE_RECEIVER,
-                                                    NULL, NULL);
-            if (rctx == NULL) {
-                ERR_print_errors_fp(stderr);
-                h2o_send_error_500(req, "Internal Server Error", "HPKE init failed", H2O_SEND_ERROR_KEEP_HEADERS);
-                return 0;
-            }
-
-            // Decapsulate
-            if (!OSSL_HPKE_decap(rctx, enc, enc_len, proxy_obliv_priv, NULL, 0)) {
-                OSSL_HPKE_CTX_free(rctx);
-                h2o_send_error_400(req, "Bad Request", "HPKE decapsulation failed", H2O_SEND_ERROR_KEEP_HEADERS);
-                return 0;
-            }
-
-            // Open
-            size_t pt_len = ct_len;
-            char  *plain  = h2o_mem_alloc_pool(&req->pool, char, pt_len);
-            if (!OSSL_HPKE_open(rctx, (unsigned char *)plain, &pt_len, NULL, 0, ct, ct_len)) {
-                OSSL_HPKE_CTX_free(rctx);
-                h2o_send_error_400(req, "Bad Request", "HPKE authentication failed", H2O_SEND_ERROR_KEEP_HEADERS);
-                return 0;
-            }
-            OSSL_HPKE_CTX_free(rctx);
-
-            if (h2o_url_parse_hostport(plain, pt_len, &host, &port) == NULL || port == 0) {
-                h2o_send_error_400(req, "Bad Request", "invalid proxy-oblivious destination", 0);
-                return 0;
-            }
-
-            /* rewrite authority and Host header */
-            char *auth = h2o_mem_alloc_pool(&req->pool, char, host.len + 6);
-            size_t authlen = snprintf(auth, host.len + 6, "%.*s:%u", (int)host.len, host.base, port);
-            req->authority = h2o_iovec_init(auth, authlen);
-            h2o_set_header(&req->pool, &req->headers, H2O_TOKEN_HOST, auth, authlen, 1);
-
-            /* remove the oblivious header before it exits the egress */
-            h2o_delete_header(&req->headers, idx);
-        }
+    /* parse host and port from authority, unless it is handled above in the case of extended connect */
+    if (h2o_url_parse_hostport(req->authority.base, req->authority.len, &host, &port) == NULL || port == 0 || port == 65535) {
+        record_error(handler, req, NULL, "http_request_error", "invalid host:port", NULL);
+        h2o_send_error_400(req, "Bad Request", "Bad Request", H2O_SEND_ERROR_KEEP_HEADERS);
+        return 0;
     }
 
-    // --- 2) Fallback: parse req->authority if we didn't already get host/port above ---
-    if (host.base == NULL) {
-        if (h2o_url_parse_hostport(req->authority.base, req->authority.len, &host, &port) == NULL
-            || port == 0 || port == 65535) {
-            record_error(handler, req, NULL, "http_request_error", "invalid host:port", NULL);
-            h2o_send_error_400(req, "Bad Request", "Bad Request", H2O_SEND_ERROR_KEEP_HEADERS);
-            return 0;
-        }
-    }
-
-    // Debug print
-    printf("on_req_classic_connect: host=%.*s port=%u\n", (int)host.len, host.base, port);
-
-    // Delegate into the shared core
-    return on_req_core(handler, req, host, port, is_tcp, /*is_masque_draft03=*/1);
+    return on_req_core((void *)handler, req, host, port, is_tcp, 1);
 }
 
 /**

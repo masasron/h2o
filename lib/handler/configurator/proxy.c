@@ -29,7 +29,6 @@
 #include "h2o/configurator.h"
 #include "h2o/balancer.h"
 #include "h2o/socket.h"
-#include "h2o/http3_oblivious.h"
 
 struct proxy_config_vars_t {
     h2o_proxy_config_vars_t conf;
@@ -137,19 +136,6 @@ static int on_config_connect_proxy_masque_draft_03(h2o_configurator_command_t *c
     if (ret == -1)
         return -1;
     self->vars->conf.support_masque_draft_03 = (int)ret;
-    return 0;
-}
-
-
-static int on_config_connect_proxy_obliv_key(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
-{
-    // must be in global scope
-    if (ctx->pathconf != NULL || ctx->hostconf != NULL) {
-        h2o_configurator_errprintf(cmd, node, "proxy.connect.oblivious-key must be specified at global level");
-        return -1;
-    }
-    /* initialize HPKE receiver with the provided Base64URL-encoded private key file */
-    init_proxy_oblivious(node->data.scalar);
     return 0;
 }
 
@@ -760,9 +746,6 @@ void h2o_proxy_register_configurator(h2o_globalconf_t *conf)
     h2o_configurator_define_command(&c->super, "proxy.connect.masque-draft-03",
                                     H2O_CONFIGURATOR_FLAG_ALL_LEVELS | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                     on_config_connect_proxy_masque_draft_03);
-    h2o_configurator_define_command(&c->super, "proxy.connect.oblivious-key",
-                                    H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
-                                    on_config_connect_proxy_obliv_key);
     h2o_configurator_define_command(&c->super, "proxy.proxy-status.identity",
                                     H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                     on_config_proxy_status_identity);
